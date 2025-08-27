@@ -5,8 +5,8 @@ import os
 from datetime import datetime
 
 # ==== CONFIG ====
-BOT_TOKEN = os.getenv("BOT_TOKEN", "your_bot_token_here")
-CHAT_ID = int(os.getenv("CHAT_ID", "-1002558399674"))
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 INTERVAL_1H = "1h"
 INTERVAL_4H = "4h"
 LOOKBACK_CANDLES = 100
