@@ -1,126 +1,139 @@
+# position_trading_bot.py
+"""
+Position trading bot — single-run version using CCXT.
+Run this once (e.g., via GitHub Actions every 30 min). It fetches top-20 USDT pairs,
+evaluates 1H signals, sends Telegram alerts, logs to CSV, and exits.
+"""
+
 import os
 import time
+import math
 import requests
-import pandas as pd
-import numpy as np
+import logging
 from datetime import datetime
 
-# ==== CONFIG ====
+import ccxt
+import pandas as pd
+import numpy as np
+
+# -------------------------
+# Configuration
+# -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")  # keep as string; Telegram accepts string/int
+CHAT_ID = os.getenv("CHAT_ID")  # string or int ok
 INTERVAL_1H = "1h"
 INTERVAL_4H = "4h"
-LOOKBACK_CANDLES = 100
+LOOKBACK_CANDLES = 200
 LOG_FILE = "hourly_position_signals.csv"
-last_alert_time = {}
 
-# Strategy Parameters
+# Strategy parameters (same as your earlier config)
 ATR_MULTIPLIER_SL = 2.0
 ATR_MULTIPLIER_TP = 3.5
 MOMENTUM_THRESHOLD = 0.01
 MIN_TREND_STRENGTH = 0.5
 
-BINANCE_BASE = "https://api.binance.com"
+TOP_N = 20  # top N USDT pairs by quoteVolume
 
-# ==== UTILITIES ====
-def _send_telegram_message_safe(msg: str):
-    """Send a Telegram message but never crash the run if Telegram fails/missing env."""
+# -------------------------
+# Logging
+# -------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+# -------------------------
+# Helpers
+# -------------------------
+def safe_dataframe(data):
+    """Return a pandas DataFrame safely from dict or list-of-dicts."""
+    if isinstance(data, dict):
+        return pd.DataFrame([data])
+    return pd.DataFrame(data)
+
+def send_telegram_message(msg: str):
     if not BOT_TOKEN or not CHAT_ID:
-        print("⚠️ BOT_TOKEN/CHAT_ID missing; skipping Telegram send.")
+        logging.warning("BOT_TOKEN or CHAT_ID not set — skipping Telegram send.")
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
     try:
         r = requests.post(url, json=payload, timeout=15)
         if r.status_code != 200:
-            print("[ERROR] Telegram send error:", r.text)
+            logging.error("Telegram error: %s", r.text)
         else:
-            print("✅ Telegram message sent")
+            logging.info("Sent Telegram message.")
     except Exception as e:
-        print("[ERROR] Telegram send exception:", e)
+        logging.exception("Telegram send failed: %s", e)
 
-def _get_json_with_retries(url: str, params=None, expect_type=list, max_retries=4, base_sleep=1.0):
-    """
-    GET JSON with retries + validation.
-    - expect_type: `list` for Binance endpoints that return arrays
-    """
-    last_err = None
-    for attempt in range(1, max_retries + 1):
+# -------------------------
+# CCXT Exchange init
+# -------------------------
+exchange = ccxt.binance({
+    # optional: set rateLimit/enableRateLimit True if needed
+    "enableRateLimit": True,
+})
+# If you face specific regional blocks, consider adding proxy config to exchange.options['proxies']
+
+# -------------------------
+# Market Data functions (ccxt)
+# -------------------------
+def get_top_n_usdt_symbols(n=TOP_N):
+    """Return top-n USDT symbols by quoteVolume using ccxt.fetch_tickers."""
+    try:
+        tickers = exchange.fetch_tickers()  # may be heavy but returns all tickers
+    except Exception as e:
+        logging.exception("fetch_tickers failed: %s", e)
+        return []
+
+    # Build list of dicts with symbol and quoteVolume
+    records = []
+    for sym, info in tickers.items():
         try:
-            resp = requests.get(url, params=params, timeout=20)
-            # Raise on non-2xx
-            resp.raise_for_status()
-            data = resp.json()
+            # ccxt symbol format: "BTC/USDT"
+            if not sym.endswith("/USDT"):
+                continue
+            qv = info.get("quoteVolume", None)
+            # sometimes ccxt returns nested dicts; convert safely
+            qv = float(qv) if qv not in (None, "") else 0.0
+            records.append({"symbol": sym, "quoteVolume": qv})
+        except Exception:
+            continue
 
-            # Binance sometimes returns {"code": ..., "msg": "..."} on errors/rate limits.
-            if isinstance(data, dict) and "code" in data and "msg" in data:
-                raise ValueError(f"Binance error: {data}")
+    df = safe_dataframe(records)
+    if df.empty:
+        return []
 
-            if expect_type is not None and not isinstance(data, expect_type):
-                raise TypeError(f"Unexpected JSON type. Expected {expect_type.__name__}, got {type(data).__name__}: {str(data)[:200]}")
-
-            return data
-
-        except Exception as e:
-            last_err = e
-            sleep_s = base_sleep * (2 ** (attempt - 1))  # exponential backoff
-            print(f"[WARN] GET {url} failed (attempt {attempt}/{max_retries}): {e} -> retrying in {sleep_s:.1f}s")
-            time.sleep(sleep_s)
-
-    # If we ran out of retries, raise a concise error
-    raise RuntimeError(f"Failed to fetch {url} after {max_retries} attempts: {last_err}")
-
-# ==== TELEGRAM ====
-def send_telegram_message(msg):
-    _send_telegram_message_safe(msg)
-
-# ==== GET SYMBOLS ====
-def get_top_20_symbols():
-    url = f"{BINANCE_BASE}/api/v3/ticker/24hr"
-    data = _get_json_with_retries(url, expect_type=list)
-    df = pd.DataFrame(data)
-
-    # Ensure required columns exist
-    if "symbol" not in df.columns or "quoteVolume" not in df.columns:
-        raise ValueError("Unexpected /ticker/24hr schema from Binance.")
-
-    # Filter + sort
-    df = df[df["symbol"].str.endswith("USDT")].copy()
-    # Some rows may have non-numeric quoteVolume during incidents; coerce safely
-    df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce")
-    df = df.dropna(subset=["quoteVolume"]).sort_values("quoteVolume", ascending=False).head(20)
+    df = df.sort_values("quoteVolume", ascending=False).head(n)
     symbols = df["symbol"].tolist()
-
-    if not symbols:
-        raise ValueError("No USDT symbols obtained from Binance 24hr ticker.")
+    logging.info("Top symbols: %s", symbols)
     return symbols
 
-# ==== GET CANDLES ====
-def get_klines(symbol, interval, limit):
-    url = f"{BINANCE_BASE}/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": int(limit)}
-    data = _get_json_with_retries(url, params=params, expect_type=list)
+def get_ohlcv_df(symbol_ccxt, timeframe="1h", limit=LOOKBACK_CANDLES):
+    """
+    Fetch OHLCV via ccxt for symbol like 'BTC/USDT'.
+    Returns DataFrame with cols: time,o,h,l,c,v (time as datetime)
+    """
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol_ccxt, timeframe=timeframe, limit=limit)
+    except Exception as e:
+        logging.exception("fetch_ohlcv failed for %s: %s", symbol_ccxt, e)
+        return pd.DataFrame()
 
-    if not data or not isinstance(data, list) or not isinstance(data[0], list):
-        raise ValueError(f"Unexpected klines response for {symbol} {interval}: {str(data)[:200]}")
+    if not ohlcv:
+        return pd.DataFrame()
 
-    cols = ['time','o','h','l','c','v','ct','qv','n','tbbav','tbqv','ignore']
-    df = pd.DataFrame(data, columns=cols[:len(data[0])])  # be len-safe
-
-    # Cast numeric cols cautiously
-    for col in ['o', 'h', 'l', 'c', 'v']:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    if 'time' in df.columns:
-        df['time'] = pd.to_datetime(df['time'], unit='ms', errors="coerce")
-
-    # Basic sanity checks
-    df = df.dropna(subset=['c'])
-    if len(df) < 50:
-        raise ValueError(f"Not enough candles for {symbol} {interval} (got {len(df)}).")
+    df = pd.DataFrame(ohlcv, columns=["time", "o", "h", "l", "c", "v"])
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    for col in ["o", "h", "l", "c", "v"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["c"])
     return df
 
-# ==== INDICATORS ====
+# -------------------------
+# Indicators (same logic as your original)
+# -------------------------
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 def sma(series, period): return series.rolling(window=period).mean()
 
@@ -196,73 +209,94 @@ def dynamic_position_sizing(volatility, base_size=1.0):
     elif volatility > 0.03: return base_size * 0.75
     else: return base_size
 
-# ==== LOG TRADES ====
-def log_hourly_trade(symbol, direction, price, sl, tp, conf_level, confidence, trend, timestamp, risk_reward, adx, position_size):
-    entry = {
-        "time": timestamp, "symbol": symbol, "direction": direction,
-        "price": price, "stop_loss": sl, "take_profit": tp,
-        "confidence": conf_level, "confidence_score": confidence,
-        "trend_4h": trend, "risk_reward": risk_reward, "adx": adx,
-        "position_size": position_size
-    }
-    df = pd.DataFrame([entry])  # <-- list of dicts avoids scalar DataFrame error
-    file_exists = os.path.exists(LOG_FILE)
-    df.to_csv(LOG_FILE, mode='a', header=not file_exists, index=False)
-    print(f"[DEBUG] Logged trade for {symbol}")
+# -------------------------
+# Check signal (adapted from your original)
+# -------------------------
+last_alert_time = {}  # in-memory dedupe per run
 
-# ==== CHECK SIGNAL ====
-def check_hourly_signal(symbol):
-    df1h = get_klines(symbol, INTERVAL_1H, LOOKBACK_CANDLES)
-    df4h = get_klines(symbol, INTERVAL_4H, LOOKBACK_CANDLES)
+def check_hourly_signal(symbol_ccxt):
+    """
+    symbol_ccxt is like 'BTC/USDT'
+    returns message string (Markdown) or None
+    """
+    # get data
+    df1h = get_ohlcv_df(symbol_ccxt, timeframe="1h", limit=LOOKBACK_CANDLES)
+    df4h = get_ohlcv_df(symbol_ccxt, timeframe="4h", limit=LOOKBACK_CANDLES)
+    if df1h.empty or df4h.empty:
+        logging.info("Insufficient data for %s", symbol_ccxt)
+        return None
 
     close = df1h['c']
     latest_time = df1h['time'].iloc[-1]
 
+    # indicators
     ema_21, ema_50, sma_200 = ema(close, 21), ema(close, 50), sma(close, 200)
     rsi_val = rsi(close, 14)
     macd_line, signal_line, _ = macd(close)
     atr_val = calculate_atr(df1h)
-    adx_val, plus_di, minus_di = adx(df1h)
+    try:
+        adx_val, plus_di, minus_di = adx(df1h)
+    except Exception:
+        adx_val, plus_di, minus_di = 0.0, 0.0, 0.0
     momentum = momentum_oscillator(df1h)
     vw_momentum = volume_weighted_momentum(df1h)
     trend_4h, trend_strength = trend_strength_4h(df4h)
 
-    close_last, ema_21_last, ema_50_last, sma_200_last = close.iloc[-1], ema_21.iloc[-1], ema_50.iloc[-1], sma_200.iloc[-1]
-    rsi_last, macd_last, signal_last = rsi_val.iloc[-1], macd_line.iloc[-1], signal_line.iloc[-1]
+    close_last = close.iloc[-1]
+    ema_21_last = ema_21.iloc[-1]
+    ema_50_last = ema_50.iloc[-1]
+    sma_200_last = sma_200.iloc[-1]
+    rsi_last = rsi_val.iloc[-1]
+    macd_last = macd_line.iloc[-1]
+    signal_last = signal_line.iloc[-1]
 
-    confidence, direction = 0.0, None
+    confidence = 0.0
+    direction = None
+
     returns = close.pct_change().dropna()
     if len(returns) < 20:
-        print(f"[INFO] Not enough returns history for {symbol}")
+        logging.info("Not enough returns for %s", symbol_ccxt)
         return None
     volatility = returns.rolling(20).std().iloc[-1]
     position_multiplier = dynamic_position_sizing(volatility)
 
-    # BUY
+    # BUY conditions
     if (ema_21_last > ema_50_last and close_last > sma_200_last and 40 < rsi_last < 75 and adx_val > 25):
         confidence += 1
-        if macd_last > signal_last and macd_last > 0: confidence += 1
-        if momentum > MOMENTUM_THRESHOLD: confidence += 1
-        if vw_momentum > 0: confidence += 1
-        if trend_4h in ["up", "strong_up"] and trend_strength > MIN_TREND_STRENGTH: confidence += 1
-        if plus_di > minus_di and adx_val > 30: confidence += 0.5
+        if macd_last > signal_last and macd_last > 0:
+            confidence += 1
+        if momentum > MOMENTUM_THRESHOLD:
+            confidence += 1
+        if vw_momentum > 0:
+            confidence += 1
+        if trend_4h in ["up", "strong_up"] and trend_strength > MIN_TREND_STRENGTH:
+            confidence += 1
+        if plus_di > minus_di and adx_val > 30:
+            confidence += 0.5
         direction = "BUY"
 
-    # SELL
+    # SELL conditions
     elif (ema_21_last < ema_50_last and close_last < sma_200_last and 25 < rsi_last < 60 and adx_val > 25):
         confidence += 1
-        if macd_last < signal_last and macd_last < 0: confidence += 1
-        if momentum < -MOMENTUM_THRESHOLD: confidence += 1
-        if vw_momentum < 0: confidence += 1
-        if trend_4h in ["down", "strong_down"] and trend_strength > MIN_TREND_STRENGTH: confidence += 1
-        if minus_di > plus_di and adx_val > 30: confidence += 0.5
+        if macd_last < signal_last and macd_last < 0:
+            confidence += 1
+        if momentum < -MOMENTUM_THRESHOLD:
+            confidence += 1
+        if vw_momentum < 0:
+            confidence += 1
+        if trend_4h in ["down", "strong_down"] and trend_strength > MIN_TREND_STRENGTH:
+            confidence += 1
+        if minus_di > plus_di and adx_val > 30:
+            confidence += 0.5
         direction = "SELL"
 
     if direction and confidence >= 4:
-        if last_alert_time.get(symbol) == latest_time:
-            print(f"[INFO] Duplicate alert skipped for {symbol}")
+        # dedupe per-run
+        key = f"{symbol_ccxt}-{latest_time}"
+        if last_alert_time.get(key):
+            logging.info("Duplicate alert for %s skipped", key)
             return None
-        last_alert_time[symbol] = latest_time
+        last_alert_time[key] = True
 
         if direction == "BUY":
             sl = round(close_last - (atr_val * ATR_MULTIPLIER_SL), 6)
@@ -272,54 +306,85 @@ def check_hourly_signal(symbol):
             tp = round(close_last - (atr_val * ATR_MULTIPLIER_TP), 6)
 
         conf_level = "Very High" if confidence >= 5.5 else "High" if confidence >= 4.5 else "Medium"
-        risk_reward = abs((tp - close_last) / (close_last - sl)) if direction == "BUY" else abs((close_last - tp) / (sl - close_last))
-
-        # Log trade to CSV (safe)
+        risk_reward = None
         try:
-            log_hourly_trade(
-                symbol, direction, close_last, sl, tp, conf_level, confidence,
-                trend_4h, latest_time, risk_reward, adx_val, position_multiplier
-            )
-        except Exception as e:
-            print("[WARN] Failed to log CSV:", e)
+            if direction == "BUY":
+                risk_reward = abs((tp - close_last) / (close_last - sl))
+            else:
+                risk_reward = abs((close_last - tp) / (sl - close_last))
+        except Exception:
+            risk_reward = float("nan")
 
-        msg = (f"*{direction} POSITION* — `{symbol}` @ {close_last}\n"
-               f"SL: `{sl}` | TP: `{tp}`\n"
-               f"Risk:Reward = 1:{risk_reward:.2f}\n"
-               f"Position Size: {position_multiplier:.2f}x\n"
-               f"Confidence: *{conf_level}* ({confidence:.1f}/6)\n"
-               f"Trend 4H: *{trend_4h}* | ADX: {adx_val:.1f}\n"
-               f"Timeframe: 1H | {latest_time.strftime('%Y-%m-%d %H:%M')}")
+        # Prepare message (replace '/' so Telegram displays nicely, keep symbol as e.g., BTC/USDT)
+        msg = (
+            f"*{direction} POSITION* — `{symbol_ccxt}` @ {close_last}\n"
+            f"SL: `{sl}` | TP: `{tp}`\n"
+            f"Risk:Reward = 1:{(risk_reward if not (risk_reward is None or math.isnan(risk_reward)) else 0):.2f}\n"
+            f"Position Size: {position_multiplier:.2f}x\n"
+            f"Confidence: *{conf_level}* ({confidence:.1f}/6)\n"
+            f"Trend 4H: *{trend_4h}* | ADX: {adx_val:.1f}\n"
+            f"Timeframe: 1H | {latest_time.strftime('%Y-%m-%d %H:%M')}"
+        )
+
+        # Log to CSV (safe)
+        try:
+            entry = {
+                "time": latest_time,
+                "symbol": symbol_ccxt,
+                "direction": direction,
+                "price": close_last,
+                "stop_loss": sl,
+                "take_profit": tp,
+                "confidence": conf_level,
+                "confidence_score": confidence,
+                "trend_4h": trend_4h,
+                "risk_reward": risk_reward,
+                "adx": adx_val,
+                "position_size": position_multiplier,
+            }
+            df_entry = safe_dataframe(entry)
+            header = not os.path.exists(LOG_FILE)
+            df_entry.to_csv(LOG_FILE, mode="a", header=header, index=False)
+        except Exception as e:
+            logging.exception("Failed to log CSV for %s: %s", symbol_ccxt, e)
+
         return msg
 
-    print(f"[INFO] No valid 1H signal for {symbol}")
     return None
 
-# ==== MAIN (single run) ====
-if __name__ == "__main__":
-    print("🚀 Bot Run Started")
+# -------------------------
+# Main single-run
+# -------------------------
+def main():
+    logging.info("Position trading bot: single-run start")
     try:
-        symbols = get_top_20_symbols()
-        found_signal = False
-        for sym in symbols:
+        top_symbols = get_top_n_usdt_symbols(TOP_N)
+        if not top_symbols:
+            logging.error("No top symbols retrieved — aborting run.")
+            send_telegram_message("🔴 Bot Error: No top symbols retrieved.")
+            return
+
+        found_any = False
+        for sym in top_symbols:
             try:
-                signal = check_hourly_signal(sym)
+                msg = check_hourly_signal(sym)
+                if msg:
+                    send_telegram_message(msg)
+                    found_any = True
+                    logging.info("Alert sent for %s", sym)
+                else:
+                    logging.debug("No signal for %s", sym)
             except Exception as e:
-                # Per-symbol failure should not kill the whole run
-                print(f"[WARN] Symbol {sym} failed: {e}")
-                continue
+                logging.exception("Error processing %s: %s", sym, e)
+                # continue to next symbol
 
-            if signal:
-                send_telegram_message(signal)
-                print(f"[ALERT] {signal}")
-                found_signal = True
-
-        if not found_signal:
-            print("[INFO] No signals found in this run.")
-
+        if not found_any:
+            logging.info("No 1H position signals found in this run.")
     except Exception as e:
-        err_msg = f"🔴 1H Bot Error: {str(e)[:180]}"
-        print("[ERROR]", err_msg)
-        _send_telegram_message_safe(err_msg)
+        logging.exception("Top-level bot error: %s", e)
+        send_telegram_message(f"🔴 1H Bot Error: {str(e)[:200]}")
+    finally:
+        logging.info("Bot run finished")
 
-    print("✅ Bot run finished")
+if __name__ == "__main__":
+    main()
