@@ -70,9 +70,12 @@ def send_telegram_message(msg: str):
 # -------------------------
 # CCXT Exchange init
 # -------------------------
+import ccxt
+
 exchange = ccxt.binance({
-    # optional: set rateLimit/enableRateLimit True if needed
     "enableRateLimit": True,
+    "options": {"defaultType": "spot"},
+    "urls": {"api": "https://testnet.binance.vision"}
 })
 # If you face specific regional blocks, consider adding proxy config to exchange.options['proxies']
 
